@@ -6,7 +6,9 @@ from datetime import datetime
 import os
 from PIL import Image, ImageTk  # 需要安装 Pillow 库
 import tkinter.ttk as ttk       # 明确导入 ttk
-
+import yfinance as yf  # 新增导入
+import ssl
+ssl._create_default_https_context = ssl._create_unverified_context
 # 定义爬取数据的函数
 def fetch_data():
     # 获取用户输入
@@ -17,14 +19,14 @@ def fetch_data():
     folder_path = folder_path_entry.get().strip()
 
     # 检查输入的有效性
-    if not code_num or not start_date or not end_date or not folder_path:
+    if not start_date or not end_date or not folder_path:
         messagebox.showerror("错误", "请输入所有必要的信息！")
         return
 
     try:
         # 将日期字符串转换为日期对象进行验证
-        datetime.strptime(start_date, "%Y-%m-%d")
-        datetime.strptime(end_date, "%Y-%m-%d")
+        start_date_obj = datetime.strptime(start_date, "%Y-%m-%d")
+        end_date_obj = datetime.strptime(end_date, "%Y-%m-%d")
     except ValueError:
         messagebox.showerror("错误", "日期格式不正确，请使用 YYYY-MM-DD 格式！")
         return
@@ -37,44 +39,162 @@ def fetch_data():
     }
     frequency = frequency_map.get(selected_frequency, "d")
 
-    # 生成文件名
-    file_name = f"{code_num.replace('.', '')}.csv"
-    res_path = os.path.join(folder_path, file_name)
-
     # 登录BaoStock
     lg = bs.login()
     if lg.error_code != '0':
         messagebox.showerror("错误", f"登录失败: {lg.error_msg}")
         return
 
-    # 动态选择字段
-    if frequency in ['w', 'm']:  # 根据频率选择对应的字段
-        fields = "date,code,open,high,low,close,volume,amount,adjustflag,turn,pctChg"
+    # 处理批量爬取
+    if code_file_path:
+        try:
+            if code_file_path.endswith('.xlsx'):
+                code_df = pd.read_excel(code_file_path)
+            elif code_file_path.endswith('.csv'):
+                code_df = pd.read_csv(code_file_path)
+            else:
+                messagebox.showerror("错误", "不支持的文件类型，请选择 .xlsx 或 .csv 文件！")
+                bs.logout()
+                return
+
+            if 'code' not in code_df.columns:
+                messagebox.showerror("错误", "文件中未找到 'code' 列！")
+                bs.logout()
+                return
+
+            codes = code_df['code'].tolist()
+            progress_window = tk.Toplevel(root)
+            progress_window.title("爬取进度")
+            progress_text = tk.Text(progress_window, height=20, width=50)
+            progress_text.pack()
+
+            total_codes = len(codes)
+            success_count = 0
+
+            for index, code in enumerate(codes, start=1):
+                code = code.strip()
+                try:
+                    progress_text.insert(tk.END, f"正在爬取股票代码: {code} ({index}/{total_codes})\n")
+                    progress_text.see(tk.END)
+                    progress_window.update()
+
+                    if "HK" in code:
+                        # 港股处理
+                        interval_map = {
+                            "d": "1d",
+                            "w": "1wk",
+                            "m": "1mo"
+                        }
+                        interval = interval_map[frequency]
+                        # 获取数据
+                        data = yf.download(code, start=start_date_obj, end=end_date_obj, interval=interval)
+                        file_name = f"{code.replace('.', '')}.csv"
+                        res_path = os.path.join(folder_path, file_name)
+                        data.to_csv(res_path, encoding="utf-8")
+                        progress_text.insert(tk.END, f"股票代码 {code} 数据已成功保存到 {res_path}\n", "success")
+                        success_count += 1
+                        continue
+
+                    # 生成文件名
+                    file_name = f"{code.replace('.', '')}.csv"
+                    res_path = os.path.join(folder_path, file_name)
+
+                    # 动态选择字段
+                    if frequency in ['w', 'm']:  # 根据频率选择对应的字段
+                        fields = "date,code,open,high,low,close,volume,amount,adjustflag,turn,pctChg"
+                    else:
+                        fields = "date,code,open,high,low,close,preclose,volume,amount,adjustflag,turn,tradestatus,pctChg,peTTM,pbMRQ,psTTM,pcfNcfTTM,isST"
+
+                    # 查询历史数据
+                    rs = bs.query_history_k_data_plus(code, fields,
+                                                      start_date, end_date,
+                                                      frequency, adjustflag="3")
+
+                    if rs.error_code != '0':
+                        progress_text.insert(tk.END, f"股票代码 {code} 数据查询失败: {rs.error_msg}\n", "error")
+                        progress_text.see(tk.END)
+                        progress_window.update()
+                        continue
+
+                    # 处理查询结果
+                    data_list = []
+                    while (rs.error_code == '0') & rs.next():
+                        data_list.append(rs.get_row_data())
+                    result = pd.DataFrame(data_list, columns=rs.fields)
+
+                    # 保存到文件
+                    try:
+                        result.to_csv(res_path, encoding="utf-8", index=False)
+                        progress_text.insert(tk.END, f"股票代码 {code} 数据已成功保存到 {res_path}\n", "success")
+                        success_count += 1
+                    except Exception as e:
+                        progress_text.insert(tk.END, f"股票代码 {code} 保存文件失败: {e}\n", "error")
+                    progress_text.see(tk.END)
+                    progress_window.update()
+                except Exception as e:
+                    progress_text.insert(tk.END, f"爬取股票代码 {code} 时出错: {e}\n", "error")
+                    progress_text.see(tk.END)
+                    progress_window.update()
+
+            progress_text.insert(tk.END, f"所有数据爬取完毕！成功 {success_count} 个，失败 {total_codes - success_count} 个\n")
+            progress_text.see(tk.END)
+            progress_text.tag_config("success", foreground="green")
+            progress_text.tag_config("error", foreground="red")
+        except Exception as e:
+            messagebox.showerror("错误", f"读取文件时出错: {e}")
     else:
-        fields = "date,code,open,high,low,close,preclose,volume,amount,adjustflag,turn,tradestatus,pctChg,peTTM,pbMRQ,psTTM,pcfNcfTTM,isST"
+        if not code_num:
+            messagebox.showerror("错误", "请输入股票代码或选择包含代码的文件！")
+            bs.logout()
+            return
 
-    # 查询历史数据
-    rs = bs.query_history_k_data_plus(code_num, fields,
-        start_date, end_date,
-        frequency, adjustflag="3")
+        if "HK" in code_num:
+            # 港股处理
+            interval_map = {
+                "d": "1d",
+                "w": "1wk",
+                "m": "1mo"
+            }
+            interval = interval_map[frequency]
+            # 获取数据
+            data = yf.download(code_num, start=start_date_obj, end=end_date_obj, interval=interval)
+            file_name = f"{code_num.replace('.', '')}.csv"
+            res_path = os.path.join(folder_path, file_name)
+            data.to_csv(res_path, encoding="utf-8")
+            messagebox.showinfo("成功", f"数据已成功保存到 {res_path}")
+        else:
+            # 生成文件名
+            file_name = f"{code_num.replace('.', '')}.csv"
+            res_path = os.path.join(folder_path, file_name)
 
-    if rs.error_code != '0':
-        messagebox.showerror("错误", f"数据查询失败: {rs.error_msg}")
-        bs.logout()
-        return
+            # 动态选择字段
+            if frequency in ['w', 'm']:  # 根据频率选择对应的字段
+                fields = "date,code,open,high,low,close,volume,amount,adjustflag,turn,pctChg"
+            else:
+                fields = "date,code,open,high,low,close,preclose,volume,amount,adjustflag,turn,tradestatus,pctChg,peTTM,pbMRQ,psTTM,pcfNcfTTM,isST"
 
-    # 处理查询结果
-    data_list = []
-    while (rs.error_code == '0') & rs.next():
-        data_list.append(rs.get_row_data())
-    result = pd.DataFrame(data_list, columns=rs.fields)
+            # 查询历史数据
+            rs = bs.query_history_k_data_plus(code_num, fields,
+                                              start_date, end_date,
+                                              frequency, adjustflag="3")
 
-    # 保存到文件
-    try:
-        result.to_csv(res_path, encoding="utf-8", index=False)
-        messagebox.showinfo("成功", f"数据已成功保存到 {res_path}")
-    except Exception as e:
-        messagebox.showerror("错误", f"保存文件失败: {e}")
+            if rs.error_code != '0':
+                messagebox.showerror("错误", f"数据查询失败: {rs.error_msg}")
+                bs.logout()
+                return
+
+            # 处理查询结果
+            data_list = []
+            while (rs.error_code == '0') & rs.next():
+                data_list.append(rs.get_row_data())
+            result = pd.DataFrame(data_list, columns=rs.fields)
+
+            # 保存到文件
+            try:
+                result.to_csv(res_path, encoding="utf-8", index=False)
+                messagebox.showinfo("成功", f"数据已成功保存到 {res_path}")
+            except Exception as e:
+                messagebox.showerror("错误", f"保存文件失败: {e}")
 
     # 登出
     bs.logout()
@@ -108,6 +228,22 @@ code_entry = ttk.Entry(root)
 code_entry.insert(0, "sz.002039")  # 默认值
 code_entry.config(width=20)  # 调整输入框宽度
 code_entry.grid(row=0, column=1, padx=10, pady=10, sticky="ew")
+
+# 选择代码文件的按钮
+code_file_path = None
+def select_code_file():
+    global code_file_path
+    file_path = filedialog.askopenfilename(title="选择包含股票代码的文件", filetypes=[("Excel 文件", "*.xlsx"), ("CSV 文件", "*.csv")])
+    if file_path:
+        if not file_path.endswith(('.xlsx', '.csv')):
+            messagebox.showerror("错误", "不支持的文件类型，请选择 .xlsx 或 .csv 文件！")
+        else:
+            code_file_path = file_path
+            messagebox.showinfo("提示", "文件上传成功，可以进行爬取！\n1.请记住 code 列是您的股票代码！"
+                                        "\n2.如果您的代码含有HK，记得加速器！\n3.港股如果抓包失败，请单个抓取！")
+
+code_file_button = ttk.Button(root, text="浏览", command=select_code_file)
+code_file_button.grid(row=0, column=2, padx=10, pady=10)
 
 # 开始日期
 start_date_label = ttk.Label(root, text="开始日期 (YYYY-MM-DD):")
